@@ -41,3 +41,5 @@ python train.py \
   --partnet_report_file_train runs/scissors_rgb/_train_report.json \
   --out_dir runs/scissors_rgb
 ```
+
+## Sampling
