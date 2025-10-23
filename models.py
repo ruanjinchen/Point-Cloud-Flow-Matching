@@ -306,3 +306,108 @@ class ConditionalLatentVelocityNet(nn.Module):
             y = y + v * dt
         return y
 
+# ---------- PVCNN-based point-flow backbone ----------
+class PVCNNVelocityNet(nn.Module):
+    """
+    Point-wise velocity field with PVCNN backbone.
+    Input/Output接口与 VelocityNet 完全一致：
+      forward(x(B,N,D), t(B,), cond(B,C)) -> v(B,N,D)
+    """
+    def __init__(self, cond_dim: int, point_dim: int = 3, emb_dim: int = 256, cfg_dropout_p: float = 0.1,
+                 pv_width: int = 128, pv_blocks: int = 3, pv_resolution: int = 32, pv_with_se: bool = True,
+                 use_xyz_feat: bool = True):
+        super().__init__()
+        self.cond_dim = int(cond_dim)
+        self.point_dim = int(point_dim)
+        self.emb_dim = int(emb_dim)
+        self.cfg_dropout_p = float(cfg_dropout_p)
+        self.use_xyz_feat = bool(use_xyz_feat)
+        self.use_rgb_feat = (self.point_dim == 6)
+
+        # ----- time/cond embedding，保持和 VelocityNet 一致 -----
+        self.t_proj = nn.Linear(emb_dim, emb_dim)
+        self.c_proj = nn.Linear(cond_dim if cond_dim > 0 else 1, emb_dim)
+        nn.init.normal_(self.t_proj.weight, std=0.02); nn.init.zeros_(self.t_proj.bias)
+        nn.init.normal_(self.c_proj.weight, std=0.02); nn.init.zeros_(self.c_proj.bias)
+
+        # ----- 引入 PVCNN 模块（modules.* 在 third_party/pvcnn/ 下） -----
+        try:
+            import os, sys
+            here = os.path.dirname(os.path.abspath(__file__))
+            tp = os.path.join(here, "third_party", "pvcnn")  # 里面应当有 modules/
+            if os.path.isdir(tp) and (tp not in sys.path):
+                sys.path.insert(0, tp)
+            from modules.pvconv import PVConv
+            from modules.shared_mlp import SharedMLP
+        except Exception as e:
+            raise ImportError(f"Cannot import PVConv: {e}. "
+                              f"Put pvcNN's 'modules/' under third_party/pvcnn/ and ensure CUDA toolchain is available.")
+
+        in_c = self.emb_dim + (3 if self.use_xyz_feat else 0) + (3 if self.use_rgb_feat else 0)
+        C = int(pv_width)
+        self.stem = SharedMLP(in_c, [C])
+        blocks = []
+        for _ in range(int(pv_blocks)):
+            blocks += [
+                PVConv(C, C, kernel_size=3, resolution=int(pv_resolution), with_se=bool(pv_with_se), normalize=True, eps=1e-6),
+                SharedMLP(C, [C]),
+            ]
+        self.blocks = nn.Sequential(*blocks)
+        self.head_mlp = SharedMLP(C, [C])                # 这层内部仍有 ReLU，但只用于中间特征
+        self.head_out = nn.Conv1d(C, self.point_dim, 1)  # 线性输出层：无 BN、无激活
+        nn.init.zeros_(self.head_out.bias)
+        nn.init.normal_(self.head_out.weight, std=1e-3)
+
+
+    def _timestep_emb(self, t, x_dtype):
+        from math import log
+        # 复用你文件里的 sinusoidal embedding 逻辑
+        # （名字同名无妨，保持一致性）
+        from models import timestep_embedding  # 即文件头部已有定义
+        return F.silu(self.t_proj(timestep_embedding(t, self.emb_dim).to(x_dtype)))
+
+    def _cond_emb(self, x, cond):
+        if self.cond_dim > 0 and cond is not None:
+            c_in = cond
+        else:
+            c_in = x.new_zeros((x.shape[0], self.cond_dim if self.cond_dim > 0 else 1))
+        return F.silu(self.c_proj(c_in))
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None,
+                cond_drop_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        x: (B,N,D), D=3 或 6；t: (B,)；cond: (B,C) 或 None
+        """
+        B, N, D = x.shape
+        if self.cond_dim > 0 and cond is not None and cond_drop_mask is not None:
+            cond = cond * (1.0 - cond_drop_mask)  # mask=1->drop
+
+        if t.dim() == 1: t = t[:, None]
+        emb = self._timestep_emb(t.squeeze(-1), x.dtype) + self._cond_emb(x, cond)  # (B,E)
+
+        coords = x[..., :3].permute(0, 2, 1).contiguous()    # (B,3,N)
+        feats = [emb[:, :, None].expand(B, self.emb_dim, N)] # (B,E,N)
+        if self.use_xyz_feat:
+            feats.append(coords)
+        if self.use_rgb_feat and D == 6:
+            feats.append(x[..., 3:].permute(0, 2, 1).contiguous())
+        feats = torch.cat(feats, dim=1)  # (B,Cin,N)
+
+        # PVCNN 的 CUDA 扩展普遍以 float32 计算；在 AMP 下手动禁用 autocast
+        with torch.cuda.amp.autocast(enabled=False):
+            f = self.stem((feats.float(), coords.float()))
+            f = self.blocks(f)               # tuple: (feat, coords)
+            feat, _ = self.head_mlp(f)       # 仍然保持 tuple 传递
+            out32 = self.head_out(feat)      # (B, point_dim, N) 线性输出
+        v = out32.permute(0, 2, 1).contiguous().to(x.dtype)
+        return v
+
+
+    @torch.no_grad()
+    def guided_velocity(self, x, t, cond, guidance_scale: float = 0.0):
+        if guidance_scale <= 0.0 or cond is None or self.cond_dim == 0:
+            return self.forward(x, t, cond, cond_drop_mask=None)
+        v_c = self.forward(x, t, cond, cond_drop_mask=None)
+        mask = torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype)
+        v_u = self.forward(x, t, cond, cond_drop_mask=mask)
+        return v_c + guidance_scale * (v_c - v_u)

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from torch import distributed as dist
 from tqdm import tqdm
-
+from models import VelocityNet, PVCNNVelocityNet
 from datasets import get_datasets, init_np_seed
 from models import VelocityNet, ConditionalLatentVelocityNet
 from models import ShapeEncoder, CondAdversary, grad_reverse
@@ -77,8 +77,12 @@ def main():
     p.add_argument("--lf_width", type=int, default=512)
     p.add_argument("--lf_depth", type=int, default=6)
     p.add_argument("--lf_emb_dim", type=int, default=256)
+    p.add_argument("--pf_backbone", type=str, default="mlp", choices=["mlp","pvcnn"])
+    p.add_argument("--pv_width", type=int, default=128)
+    p.add_argument("--pv_blocks", type=int, default=3)
+    p.add_argument("--pv_res", type=int, default=32)
+    p.add_argument("--pv_with_se", action="store_true", default=True)
 
-    # 新增：颜色开关（latent/point flow）
     p.add_argument("--use_rgb_in_latent", action="store_true", default=True,
                    help="Encoder 的输入是否拼 rgb（若数据有 rgb）")
     p.add_argument("--pointflow_rgb", action="store_true", default=True,
@@ -98,11 +102,9 @@ def main():
     # FM priors
     p.add_argument("--point_prior_std", type=float, default=1.0, help="XYZ 高斯先验的 std")
     p.add_argument("--latent_prior_std", type=float, default=1.0)
-    # 新增：颜色先验
     p.add_argument("--color_prior", type=str, choices=["gauss","uniform","zeros"], default="gauss",
                    help="PF 中 RGB 维度的初始分布：高斯/均匀[0,1]/全 0")
     p.add_argument("--color_prior_std", type=float, default=1.0, help="当 color_prior=gauss 时使用")
-
     p.add_argument("--sample_steps", type=int, default=50)
     p.add_argument("--guidance_scale", type=float, default=0.0)
 
@@ -114,7 +116,6 @@ def main():
     p.add_argument("--lambda_var", type=float, default=1.0)
     p.add_argument("--lambda_cov", type=float, default=0.01)
     p.add_argument("--lambda_zreg", type=float, default=1e-4)
-    # 新增：颜色损失权重
     p.add_argument("--lambda_color", type=float, default=1.0, help="PF 中颜色分量的损失权重")
 
     # System
@@ -162,8 +163,17 @@ def main():
     # PF point_dim 决定是否在 6D 上学习
     pf_point_dim = 6 if (args.pointflow_rgb and args.has_rgb) else 3
     pf_cond_dim = args.latent_dim + args.cond_dim
-    pf = VelocityNet(cond_dim=pf_cond_dim, width=args.pf_width, depth=args.pf_depth,
-                     emb_dim=args.pf_emb_dim, cfg_dropout_p=args.cfg_drop_p, point_dim=pf_point_dim).to(args.device)
+    
+    if args.pf_backbone == "pvcnn":
+        pf = PVCNNVelocityNet(cond_dim=pf_cond_dim, point_dim=pf_point_dim,
+                            emb_dim=args.pf_emb_dim, cfg_dropout_p=args.cfg_drop_p,
+                            pv_width=args.pv_width, pv_blocks=args.pv_blocks,
+                            pv_resolution=args.pv_res, pv_with_se=args.pv_with_se).to(args.device)
+    else:
+        pf = VelocityNet(cond_dim=pf_cond_dim, width=args.pf_width, depth=args.pf_depth,
+                        emb_dim=args.pf_emb_dim, cfg_dropout_p=args.cfg_drop_p,
+                        point_dim=pf_point_dim).to(args.device)
+    
     lf = ConditionalLatentVelocityNet(args.latent_dim, cond_dim=0, width=args.lf_width,
                                       depth=args.lf_depth, emb_dim=args.lf_emb_dim).to(args.device)
     ema_pf = EMA(pf, decay=0.999); ema_lf = EMA(lf, decay=0.999)
@@ -687,5 +697,23 @@ python train.py \
   --latent_dim 128 \
   --lambda_pair 0.0 \
   --out_dir runs/partnet_airplane
+
+
+
+[钳子 pvcnn]
+python train.py \
+  --dataset_type partnet_h5 \
+  --data_dir ../Dataset/partnet/Pliers \
+  --batch_size 8 --epochs 3000 --save_every 10 \
+  --tr_max_sample_points 20000 --te_max_sample_points 20000 \
+  --tdcr_use_norm \
+  --latent_dim 128 \
+  --partnet_cond_policy mode \
+  --lambda_pair 0.1 --lambda_var 1.0 --lambda_cov 0.01 --lambda_zreg 1e-4 \
+  --lambda_adv 0.0 \
+  --pf_backbone pvcnn \
+  --pv_width 128 --pv_blocks 3 --pv_res 32 --pv_with_se \
+  --partnet_report_file_train runs/pliers_pvcnn/_train_report.json \
+  --out_dir runs/pliers_pvcnn
 
 '''

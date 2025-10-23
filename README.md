@@ -40,17 +40,37 @@ conda install -y --override-channels --solver=libmamba \
 cd third_party/pvcnn
 export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0;12.0"
 export CUDA_HOME="$CONDA_PREFIX"
-export MAX_JOBS=16
+export CPATH="$CONDA_PREFIX/include:$CONDA_PREFIX/targets/x86_64-linux/include:${CPATH}"
+export LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/targets/x86_64-linux/lib:${LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}"
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
+export CUDAHOSTCXX=/usr/bin/g++
 
 python - <<'PY'
 import time
-print("[Step] import modules.functional.backend 以触发JIT编译……")
-t0=time.time()
-from modules.functional import backend  # 这里会调用 torch.utils.cpp_extension.load(...)
-print("[OK ] _pvcnn_backend 已加载，用时 %.1fs" % (time.time()-t0))
+t=time.time()
+from modules.functional import backend
+print("[OK] pvcnn backend built in %.1fs" % (time.time()-t))
 PY
 ```
-
+Check
+```sh
+python - <<'PY'
+try:
+  import os, sys
+  here = os.path.dirname(os.path.abspath(__file__))
+  tp = os.path.join(here, "third_party", "pvcnn")  # 里面应当有 modules/
+  if os.path.isdir(tp) and (tp not in sys.path):
+      sys.path.insert(0, tp)
+  from modules.pvconv import PVConv
+  from modules.shared_mlp import SharedMLP
+  print("IMPORT SUCCESS")
+except Exception as e:
+  raise ImportError(f"Cannot import PVConv: {e}. "
+                    f"Put pvcNN's 'modules/' under third_party/pvcnn/ and ensure CUDA toolchain is available.")
+PY
+```
 ### PyTorchEMD
 ```sh
 cd third_party/PyTorchEMD
