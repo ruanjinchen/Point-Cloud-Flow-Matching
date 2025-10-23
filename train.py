@@ -85,7 +85,7 @@ def main():
 
     p.add_argument("--use_rgb_in_latent", action="store_true", default=True,
                    help="Encoder 的输入是否拼 rgb（若数据有 rgb）")
-    p.add_argument("--pointflow_rgb", action="store_true", default=True,
+    p.add_argument("--pointflow_rgb", action="store_true", default=False,
                    help="Point flow 是否在 6D(xyz+rgb) 上学习/采样（若数据有 rgb）")
 
     # Training
