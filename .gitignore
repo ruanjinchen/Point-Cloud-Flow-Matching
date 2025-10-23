@@ -1,0 +1,33 @@
+# —— Python 编译与缓存 —— 
+__pycache__/
+*.py[cod]
+*.so
+
+# —— 虚拟环境 / 依赖 —— 
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+*.egg-info/
+
+# —— 构建产物 —— 
+build/
+dist/
+
+# —— 工具缓存 —— 
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# —— IDE/系统杂项 —— 
+.vscode/
+.idea/
+.DS_Store
+
+# —— 数据目录（示例）——
+runs/
+# 若你想忽略整个 data，但保留说明文件：
+!data/README.md
