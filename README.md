@@ -1,9 +1,16 @@
 # Point-Cloud-Flow-Matching  
-This is a RGB Point Cloud Generation Model based on Flow Matching implemented using PyTorch. Tested on Windows11 CUDA 13.0 and Ubuntu22.04 CUDA 12.4.  
+This is a RGB Point Cloud Generation Model based on Flow Matching implemented using PyTorch.  
+Tested on
+- Windows11 CUDA 13.0
+- Ubuntu22.04 CUDA 12.4
+- Ubuntu22.04 CUDA 13.0  
 ![A random sample eyeglass](./assets/pred_4.png)
 ## Installation
 
 ```sh
+conda create -y -n flow python=3.12
+conda init
+conda activate flow
 pip install -r requirements.txt
 ```
 **CHOOSE YOUR OWN CUDA VERSION!!! DO NOT RUN ALL THE COMMAND BELLOW!!!**
