@@ -78,10 +78,28 @@ def main():
     p.add_argument("--lf_depth", type=int, default=6)
     p.add_argument("--lf_emb_dim", type=int, default=256)
     p.add_argument("--pf_backbone", type=str, default="mlp", choices=["mlp","pvcnn"])
+
     p.add_argument("--pv_width", type=int, default=128)
     p.add_argument("--pv_blocks", type=int, default=3)
     p.add_argument("--pv_res", type=int, default=32)
     p.add_argument("--pv_with_se", action="store_true", default=True)
+
+    p.add_argument("--pv_norm", type=str, default="group", choices=["group","batch","syncbn","none"])
+    p.add_argument("--pv_gn_groups", type=int, default=32)
+
+    p.add_argument("--pv_num_stages", type=int, default=3,
+                help="仅用于检查/日志；实际由下三项的长度决定")
+    p.add_argument("--pv_stage_channels", type=int, nargs="+", default=None,
+                help="例如: 128 256 256；若为空将基于 pv_width 自动推导")
+    p.add_argument("--pv_stage_blocks", type=int, nargs="+", default=None,
+                help="例如: 2 2 2；若为空将基于 pv_blocks 自动推导")
+    p.add_argument("--pv_stage_res", type=int, nargs="+", default=None,
+                help="例如: 32 16 8；若为空将基于 pv_res 自动推导")
+
+    p.add_argument("--pv_freeze_bn_after", type=int, default=50,
+                help="第几轮开始将 BN 固定为 eval()（仅当 norm=batch/syncbn 时有意义）")
+    p.add_argument("--pv_head_drop", type=float, default=0.0)
+
 
     p.add_argument("--use_rgb_in_latent", action="store_true", default=True,
                    help="Encoder 的输入是否拼 rgb（若数据有 rgb）")
@@ -134,6 +152,22 @@ def main():
 
     args = p.parse_args()
 
+    # ---- PVCNN stage 默认推导 ----
+
+    if args.pv_stage_channels is None:
+        baseC = int(args.pv_width)
+        args.pv_stage_channels = [baseC, baseC * 2, baseC * 2]
+    if args.pv_stage_blocks is None:
+        if args.pv_blocks >= 3:
+            args.pv_stage_blocks = [max(1, args.pv_blocks // 3)] * 3
+        else:
+            args.pv_stage_blocks = [1, 1, 1]
+    if args.pv_stage_res is None:
+        r = int(args.pv_res)
+        args.pv_stage_res = [max(1, r), max(1, r // 2), max(1, r // 4)]
+    args.pv_num_stages = len(args.pv_stage_channels)
+
+
     is_dist, rank, world_size, local_rank = init_distributed()
     args.is_distributed = is_dist; args.rank=rank; args.world_size=world_size; args.local_rank=local_rank
     args.device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
@@ -165,14 +199,28 @@ def main():
     pf_cond_dim = args.latent_dim + args.cond_dim
     
     if args.pf_backbone == "pvcnn":
-        pf = PVCNNVelocityNet(cond_dim=pf_cond_dim, point_dim=pf_point_dim,
-                            emb_dim=args.pf_emb_dim, cfg_dropout_p=args.cfg_drop_p,
-                            pv_width=args.pv_width, pv_blocks=args.pv_blocks,
-                            pv_resolution=args.pv_res, pv_with_se=args.pv_with_se).to(args.device)
+        pf = PVCNNVelocityNet(
+            cond_dim=pf_cond_dim, point_dim=pf_point_dim,
+            emb_dim=args.pf_emb_dim, cfg_dropout_p=args.cfg_drop_p,
+            # 兼容旧参数：若下方 lists 未给，类里也会再次推导
+            pv_width=args.pv_width, pv_blocks=args.pv_blocks,
+            pv_resolution=args.pv_res, pv_with_se=args.pv_with_se,
+            # 新：多 stage 配置
+            pv_channels=args.pv_stage_channels,
+            pv_blocks_per_stage=args.pv_stage_blocks,
+            pv_resolutions=args.pv_stage_res,
+            # 新：归一化/FiLM/全局/头部
+            norm_type=args.pv_norm, gn_groups=args.pv_gn_groups,
+            film_one_plus=False,      # Zero-init 残差更稳；如需 1+γ 方式可改 True
+            with_global=True,
+            head_drop=args.pv_head_drop,
+            head_zero_init=True
+        ).to(args.device)
     else:
         pf = VelocityNet(cond_dim=pf_cond_dim, width=args.pf_width, depth=args.pf_depth,
                         emb_dim=args.pf_emb_dim, cfg_dropout_p=args.cfg_drop_p,
                         point_dim=pf_point_dim).to(args.device)
+
     
     lf = ConditionalLatentVelocityNet(args.latent_dim, cond_dim=0, width=args.lf_width,
                                       depth=args.lf_depth, emb_dim=args.lf_emb_dim).to(args.device)
@@ -185,6 +233,11 @@ def main():
         print(f"cond_dim(joint)={args.cond_dim}  latent_dim={args.latent_dim}  pf_cond_dim={pf_cond_dim}  enc_in_channels={enc_in_ch}  pf_point_dim={pf_point_dim}")
 
     model_pf = pf
+
+    # 若选择 syncbn：将全模型 BN 转换为 SyncBatchNorm
+    if args.pf_backbone == "pvcnn" and args.pv_norm == "syncbn" and torch.cuda.device_count() > 1:
+        pf = torch.nn.SyncBatchNorm.convert_sync_batchnorm(pf)
+
     if is_dist:
         from torch.nn.parallel import DistributedDataParallel as DDP
         enc = DDP(enc, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False, find_unused_parameters=False)
@@ -428,6 +481,13 @@ def main():
 
     # --------------------------- 训练循环 ---------------------------
     for ep in range(start_epoch, args.epochs + 1):  # [Auto-Resume] 从 start_epoch 继续
+        # 冻结 BN（提升小 batch/长训稳定性）
+        if args.pf_backbone == "pvcnn" and args.pv_norm in ["batch","syncbn"] and ep == args.pv_freeze_bn_after:
+            net_pf = pf.module if hasattr(pf, "module") else pf
+            if hasattr(net_pf, "set_bn_eval"):
+                net_pf.set_bn_eval(True)
+                if rank == 0: print(f"[Info] Freeze BatchNorm at epoch {ep}.")
+
         if is_dist and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(ep)
         enc.train(); pf.train(); lf.train(); adv.train()
@@ -712,8 +772,14 @@ python train.py \
   --lambda_pair 0.1 --lambda_var 1.0 --lambda_cov 0.01 --lambda_zreg 1e-4 \
   --lambda_adv 0.0 \
   --pf_backbone pvcnn \
-  --pv_width 128 --pv_blocks 3 --pv_res 32 --pv_with_se \
+  --pv_width 128 --pv_blocks 6 --pv_res 32 --pv_with_se \
+  --pv_norm group --pv_gn_groups 32 \
+  --pv_stage_channels 128 256 256 \
+  --pv_stage_blocks 2 2 2 \
+  --pv_stage_res 32 16 8 \
+  --pv_freeze_bn_after 50 \
   --partnet_report_file_train runs/pliers_pvcnn/_train_report.json \
   --out_dir runs/pliers_pvcnn
+
 
 '''
