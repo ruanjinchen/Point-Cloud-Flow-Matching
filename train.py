@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
+from torch import distributed as dist
 
 # ---- datasets / models / utils ----
 from datasets import get_datasets, init_np_seed
@@ -15,7 +16,51 @@ from util import EMA, seed_all, init_distributed, cleanup_distributed, cosine_lr
 from util import save_point_cloud_ply_rgb
 
 
-# ---- AMP helpers（与我们先前脚本一致） ----
+# ========== EMA eval helper ==========
+from contextlib import contextmanager
+import torch.nn as nn
+import torch
+
+@contextmanager
+def use_ema_weights(module: nn.Module, ema_shadow: dict | None, enabled: bool = True):
+    """
+    临时用 EMA 权重覆盖 module 的浮点参数/缓冲区，退出时恢复原值。
+    用法：
+        with use_ema_weights(net_pf, ema_pf.shadow, enabled=True):
+            # eval forward ...
+    """
+    if (not enabled) or (ema_shadow is None):
+        yield module
+        return
+
+    device = next(module.parameters()).device
+    saved_params, saved_bufs = {}, {}
+
+    # 覆盖可训练参数
+    for name, p in module.named_parameters(recurse=True):
+        if p.dtype.is_floating_point and (name in ema_shadow):
+            saved_params[name] = p.data.detach().clone()
+            p.data.copy_(ema_shadow[name].to(device=device, dtype=p.dtype))
+
+    # 覆盖浮点 buffer（如 BN 的 running_mean/var 等）
+    for name, b in module.named_buffers(recurse=True):
+        if torch.is_tensor(b) and b.dtype.is_floating_point and (name in ema_shadow):
+            saved_bufs[name] = b.data.detach().clone()
+            b.data.copy_(ema_shadow[name].to(device=device, dtype=b.dtype))
+
+    try:
+        yield module
+    finally:
+        # 恢复
+        for name, p in module.named_parameters(recurse=True):
+            if name in saved_params:
+                p.data.copy_(saved_params[name])
+        for name, b in module.named_buffers(recurse=True):
+            if name in saved_bufs:
+                b.data.copy_(saved_bufs[name])
+
+
+# ---- AMP helpers ----
 _USE_NEW_AMP = hasattr(torch, "amp") and hasattr(torch.amp, "autocast")
 def make_autocast(enabled: bool, use_bf16: bool):
     dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -34,7 +79,7 @@ def make_scaler(enabled: bool):
 # ---- metrics ----
 @torch.no_grad()
 def chamfer_l2(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    # 与我们之前的实现一致：双向最近邻 L2^2 的和（按 batch 求均值）
+    # 双向最近邻 L2^2 的和（按 batch 求均值）
     d2 = torch.cdist(pred, target, p=2).pow(2)
     return d2.min(dim=2).values.mean(dim=1) + d2.min(dim=1).values.mean(dim=1)
 
@@ -225,62 +270,88 @@ def main():
     # ---- 可视化：GT 编码重建（z=encoder(x)） ----
     @torch.no_grad()
     def save_val_recon(ep: int):
-        net_pf  = pf.module  if hasattr(pf, "module")  else pf
+        """
+        使用 EMA 权重评估 + Heun(RK2) 积分的重建可视化。
+        - latent 直接由 encoder 得到（不是采样）
+        - point-flow 用 Heun (predictor-corrector)
+        """
+        # 取出 DDP 包裹内的真实模块（若无 DDP，等价于自身）
+        net_pf  = pf.module  if hasattr(pf,  "module") else pf
         net_enc = enc.module if hasattr(enc, "module") else enc
-        net_pf.eval(); net_enc.eval()
+        net_lf  = lf.module  if hasattr(lf,  "module") else lf   # 为了统一用 EMA 包裹
 
-        pts = val_batch["test_points"].to(args.device).float()
+        net_pf.eval(); net_enc.eval(); net_lf.eval()
+
+        # 取出一个固定的验证 batch
+        pts = val_batch["test_points"].to(args.device).float()  # (B,N,3)
         rgb = val_batch.get("test_rgb", None)
         if rgb is not None:
             rgb = rgb.to(args.device).float()
 
-        # 编码 z
+        # 编码器输入（是否拼 RGB 由 enc_in_ch 决定）
         enc_in = pts if (enc_in_ch == 3 or rgb is None) else torch.cat([pts, rgb], dim=-1)
-        z_gt, _ = net_enc(enc_in)
 
-        # PF 目标维度
-        data_pf = torch.cat([pts, rgb], dim=-1) if (pf_point_dim == 6 and rgb is not None) else pts
+        # 是否在评估时使用 EMA 权重
+        use_ema = bool(getattr(args, "ema_eval", True))
+        with use_ema_weights(net_pf, ema_pf.shadow, enabled=use_ema), \
+            use_ema_weights(net_lf, ema_lf.shadow, enabled=use_ema):
 
-        # flow 积分（Heun/Euler 二选一都行，这里用简单中点 Euler）
-        x = make_pf_prior_like(data_pf)
-        dt = 1.0 / max(1, args.sample_steps)
-        for i in range(args.sample_steps):
-            t = torch.full((x.shape[0],), (i + 0.5) * dt, device=x.device, dtype=x.dtype)
-            # 构造与训练一致的 cond_full（z [+ joint]）
+            # 1) 得到 z_gt
+            z_gt, _ = net_enc(enc_in)   # (B, latent_dim)
+
+            # 2) 构造 cond_full = [z_gt | cond]，维度与 pf 构造时的 cond_dim 对齐
             B = z_gt.shape[0]
             cond_j = val_batch.get("cond", None)
             if cond_j is not None:
                 cond_j = cond_j.to(args.device).to(z_gt.dtype)
                 cond_full = torch.cat([z_gt, cond_j], dim=1)
             else:
-                # 若模型的 cond_dim>0，而验证 batch 没有 cond，就用 0 填充
-                if getattr(args, "cond_dim", 0) > 0:
-                    pad = torch.zeros((B, args.cond_dim), device=args.device, dtype=z_gt.dtype)
+                # 若模型有额外 cond 维度但验证集未提供，则补零
+                need = int(getattr(args, "cond_dim", 0))
+                if need > 0:
+                    pad = torch.zeros((B, need), device=args.device, dtype=z_gt.dtype)
                     cond_full = torch.cat([z_gt, pad], dim=1)
                 else:
                     cond_full = z_gt
 
-            v = net_pf.guided_velocity(x, t, cond_full, guidance_scale=args.guidance_scale)
+            # 3) Point-Flow 的初始先验 x0
+            data_pf = torch.cat([pts, rgb], dim=-1) if (pf_point_dim == 6 and rgb is not None) else pts
+            x = make_pf_prior_like(data_pf)  # (B,N,3/6)
 
-            x = x + v * dt
+            # 4) Heun (RK2) 预测-校正积分：t0=k/steps → t1=(k+1)/steps
+            steps = max(1, int(args.sample_steps))
+            dt = 1.0 / steps
+            for k in range(steps):
+                t0 = torch.full((B,), k * dt,          device=x.device, dtype=x.dtype)
+                v1 = net_pf.guided_velocity(x, t0, cond_full, guidance_scale=args.guidance_scale)
+                x_hat = x + v1 * dt
+                t1 = torch.full((B,), (k + 1) * dt,    device=x.device, dtype=x.dtype)
+                v2 = net_pf.guided_velocity(x_hat, t1, cond_full, guidance_scale=args.guidance_scale)
+                x = x + 0.5 * dt * (v1 + v2)
 
-        # 保存 PLY & 打印 CD
+        # 5) 保存与评估
         out_dir = os.path.join(args.out_dir, f"samples_recon_ep{ep:04d}")
-        if rank == 0:
+        if args.rank == 0:
             os.makedirs(out_dir, exist_ok=True)
             for i in range(min(args.vis_count, x.shape[0])):
-                if x.shape[-1] == 6 and (save_point_cloud_ply_rgb is not None) and (rgb is not None):
+                if x.shape[-1] == 6 and (rgb is not None) and ("save_point_cloud_ply_rgb" in globals() and save_point_cloud_ply_rgb is not None):
                     save_point_cloud_ply_rgb(x[i, :, :3], x[i, :, 3:].clamp(0,1), os.path.join(out_dir, f"pred_{i}.ply"))
-                    save_point_cloud_ply_rgb(pts[i], rgb[i].clamp(0,1),          os.path.join(out_dir, f"gt_{i}.ply"))
+                    save_point_cloud_ply_rgb(pts[i],       rgb[i].clamp(0,1),    os.path.join(out_dir, f"gt_{i}.ply"))
                 else:
                     save_point_cloud_ply(x[i, :, :3] if x.shape[-1] == 6 else x[i], os.path.join(out_dir, f"pred_{i}.ply"))
-                    save_point_cloud_ply(pts[i],                                        os.path.join(out_dir, f"gt_{i}.ply"))
+                    save_point_cloud_ply(pts[i],                                           os.path.join(out_dir, f"gt_{i}.ply"))
             cd = chamfer_l2(x[:, :, :3] if x.shape[-1] == 6 else x, pts).mean().item()
-            print(f"[Val-Recon ep{ep:04d}] CD = {cd:.4f}")
+            print(f"[Val-Recon ep{ep:04d}] CD = {cd:.4f} (EMA={use_ema}, Heun)")
+
 
     # ---- 可视化：随机 z 采样 ----
     @torch.no_grad()
     def save_val_samples(ep: int):
+        """
+        使用 EMA 权重评估 + Heun(RK2) 的随机采样可视化：
+        - latent-flow：Heun 采样 z
+        - point-flow：Heun 从 x0 积分到数据域
+        """
         net_pf = pf.module if hasattr(pf, "module") else pf
         net_lf = lf.module if hasattr(lf, "module") else lf
         net_pf.eval(); net_lf.eval()
@@ -290,53 +361,176 @@ def main():
         if rgb is not None:
             rgb = rgb.to(args.device).float()
 
-        # latent 采样：y0 ~ N(0,σ^2 I) → z（无条件）
-        B = pts.shape[0]
-        eps_z = torch.randn((B, args.latent_dim), device=args.device, dtype=pts.dtype) * args.latent_prior_std
-        z = eps_z
-        dt = 1.0 / max(1, args.sample_steps)
-        for i in range(args.sample_steps):
-            t = torch.full((B,), (i + 0.5) * dt, device=z.device, dtype=z.dtype)
-            v = net_lf(z, t, cond=None)
-            z = z + v * dt
+        use_ema = bool(getattr(args, "ema_eval", True))
+        with use_ema_weights(net_pf, ema_pf.shadow, enabled=use_ema), \
+            use_ema_weights(net_lf, ema_lf.shadow, enabled=use_ema):
 
-        # point-flow：x0 ~ prior → data
-        target_pf = torch.cat([pts, rgb], dim=-1) if (pf_point_dim == 6 and rgb is not None) else pts
-        x = make_pf_prior_like(target_pf)
-        for i in range(args.sample_steps):
-            t = torch.full((x.shape[0],), (i + 0.5) * dt, device=x.device, dtype=x.dtype)
+            B = pts.shape[0]
+
+            # 1) latent-flow（无条件）Heun 采样：y0 ~ N(0,σ^2 I) → z
+            z = torch.randn((B, args.latent_dim), device=args.device, dtype=pts.dtype) * args.latent_prior_std
+            steps = max(1, int(args.sample_steps))
+            dt = 1.0 / steps
+            for k in range(steps):
+                t0 = torch.full((B,), k * dt,       device=z.device, dtype=z.dtype)
+                v1 = net_lf(z, t0, cond=None)
+                z_hat = z + v1 * dt
+                t1 = torch.full((B,), (k + 1) * dt, device=z.device, dtype=z.dtype)
+                v2 = net_lf(z_hat, t1, cond=None)
+                z = z + 0.5 * dt * (v1 + v2)
+
+            # 2) cond_full = [z | cond]，与训练对齐
             cond_j = val_batch.get("cond", None)
-            B = z.shape[0]
             if cond_j is not None:
                 cond_j = cond_j.to(args.device).to(z.dtype)
                 cond_full = torch.cat([z, cond_j], dim=1)
             else:
-                if getattr(args, "cond_dim", 0) > 0:
-                    pad = torch.zeros((B, args.cond_dim), device=args.device, dtype=z.dtype)
+                need = int(getattr(args, "cond_dim", 0))
+                if need > 0:
+                    pad = torch.zeros((B, need), device=args.device, dtype=z.dtype)
                     cond_full = torch.cat([z, pad], dim=1)
                 else:
                     cond_full = z
 
-            v = net_pf.guided_velocity(x, t, cond_full, guidance_scale=args.guidance_scale)
+            # 3) point-flow：x0 ~ prior → Heun 积分
+            target_pf = torch.cat([pts, rgb], dim=-1) if (pf_point_dim == 6 and rgb is not None) else pts
+            x = make_pf_prior_like(target_pf)
+            for k in range(steps):
+                t0 = torch.full((B,), k * dt,       device=x.device, dtype=x.dtype)
+                v1 = net_pf.guided_velocity(x, t0, cond_full, guidance_scale=args.guidance_scale)
+                x_hat = x + v1 * dt
+                t1 = torch.full((B,), (k + 1) * dt, device=x.device, dtype=x.dtype)
+                v2 = net_pf.guided_velocity(x_hat, t1, cond_full, guidance_scale=args.guidance_scale)
+                x = x + 0.5 * dt * (v1 + v2)
 
-            x = x + v * dt
-
-        # 保存 & CD
-        if rank == 0:
+        # 4) 保存 & 评估
+        if args.rank == 0:
             out_dir = os.path.join(args.out_dir, f"samples_ep{ep:04d}")
             os.makedirs(out_dir, exist_ok=True)
             for i in range(min(args.vis_count, x.shape[0])):
-                if x.shape[-1] == 6 and (save_point_cloud_ply_rgb is not None) and (rgb is not None):
+                if x.shape[-1] == 6 and (rgb is not None) and ("save_point_cloud_ply_rgb" in globals() and save_point_cloud_ply_rgb is not None):
                     save_point_cloud_ply_rgb(x[i, :, :3], x[i, :, 3:].clamp(0,1), os.path.join(out_dir, f"pred_{i}.ply"))
-                    save_point_cloud_ply_rgb(pts[i], rgb[i].clamp(0,1),          os.path.join(out_dir, f"gt_{i}.ply"))
+                    save_point_cloud_ply_rgb(pts[i],       rgb[i].clamp(0,1),    os.path.join(out_dir, f"gt_{i}.ply"))
                 else:
                     save_point_cloud_ply(x[i, :, :3] if x.shape[-1] == 6 else x[i], os.path.join(out_dir, f"pred_{i}.ply"))
-                    save_point_cloud_ply(pts[i],                                        os.path.join(out_dir, f"gt_{i}.ply"))
+                    save_point_cloud_ply(pts[i],                                           os.path.join(out_dir, f"gt_{i}.ply"))
             cd = chamfer_l2(x[:, :, :3] if x.shape[-1] == 6 else x, pts).mean().item()
-            print(f"[Val ep{ep:04d}] random-z CD = {cd:.4f}")
+            print(f"[Val ep{ep:04d}] random-z CD = {cd:.4f} (EMA={use_ema}, Heun)")
+
+
+    # =========================
+    # [Auto-Resume] 自动恢复段 + 设备修复
+    # =========================
+    import re
+    from contextlib import contextmanager
+
+    def _find_latest_ckpt(ckpt_dir: str):
+        """返回 (path, epoch)；找不到则 (None, 0)。"""
+        if not os.path.isdir(ckpt_dir):
+            return None, 0
+        best_ep, best_path = 0, None
+        for fn in os.listdir(ckpt_dir):
+            m = re.match(r"hybrid_ep(\d+)\.pt$", fn)
+            if m:
+                ep = int(m.group(1))
+                if ep > best_ep:
+                    best_ep = ep
+                    best_path = os.path.join(ckpt_dir, fn)
+        return best_path, best_ep
+
+    def _move_opt_state_to_device(opt: torch.optim.Optimizer, device: torch.device):
+        """把优化器状态里的 tensor 迁移到目标 device，防止恢复后因设备不一致报错。"""
+        for st in opt.state.values():
+            for k, v in list(st.items()):
+                if torch.is_tensor(v):
+                    st[k] = v.to(device)
+
+    def _safe_load_ema(ema_obj: EMA, state_dict: dict, ref_model: nn.Module, device: torch.device):
+        """
+        以当前 ema_obj.shadow 为“完整键集合”，用 ckpt 中重叠键覆盖，并迁移到 device。
+        这样避免 KeyError，同时解决 CPU/GPU 设备不一致。
+        """
+        cur = ema_obj.shadow  # 已含全键
+        ref_sd = ref_model.state_dict()
+        for k in cur.keys():
+            if k in state_dict:
+                v = state_dict[k]
+                if torch.is_tensor(v) and v.dtype.is_floating_point:
+                    cur[k] = v.to(device=device, dtype=ref_sd[k].dtype)
+        ema_obj.shadow = cur
+
+    start_epoch = 1
+    ckpt_path, ckpt_ep = _find_latest_ckpt(os.path.join(args.out_dir, "ckpts"))
+    if ckpt_path is not None:
+        if rank == 0:
+            print(f"[Auto-Resume] Found latest ckpt: {ckpt_path} (ep={ckpt_ep})")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        # 恢复模型（DDP 下要拿 .module）
+        enc_t = enc.module if hasattr(enc, "module") else enc
+        pf_t  = pf.module  if hasattr(pf,  "module") else pf
+        lf_t  = lf.module  if hasattr(lf,  "module") else lf
+
+        if "encoder" in ckpt: enc_t.load_state_dict(ckpt["encoder"], strict=True)
+        if "pf" in ckpt:      pf_t.load_state_dict(ckpt["pf"], strict=False)
+        elif "model" in ckpt: pf_t.load_state_dict(ckpt["model"], strict=False)  # 兼容旧键名
+        if "lf" in ckpt:      lf_t.load_state_dict(ckpt["lf"], strict=False)
+
+        # 恢复 EMA（并迁移到正确设备 + 键对齐）
+        if "ema_pf" in ckpt and isinstance(ckpt["ema_pf"], dict):
+            _safe_load_ema(ema_pf, ckpt["ema_pf"], pf_t, device=torch.device(args.device))
+            pf.ema_shadow = ema_pf.shadow
+        if "ema_lf" in ckpt and isinstance(ckpt["ema_lf"], dict):
+            _safe_load_ema(ema_lf, ckpt["ema_lf"], lf_t, device=torch.device(args.device))
+            lf.ema_shadow = ema_lf.shadow
+
+        # 恢复优化器 / AMP scaler（若存在），并把优化器状态迁移到当前 device
+        if "opt" in ckpt:
+            try:
+                opt.load_state_dict(ckpt["opt"])
+                _move_opt_state_to_device(opt, torch.device(args.device))
+            except Exception as e:
+                if rank == 0: print(f"[Auto-Resume][WARN] opt state load failed: {e}")
+        elif "opt_main" in ckpt:  # 兼容老 ckpt 键名
+            try:
+                opt.load_state_dict(ckpt["opt_main"])
+                _move_opt_state_to_device(opt, torch.device(args.device))
+            except Exception as e:
+                if rank == 0: print(f"[Auto-Resume][WARN] opt_main->opt load failed: {e}")
+
+        if args.amp and ("scaler" in ckpt) and (ckpt["scaler"] is not None):
+            try:
+                scaler.load_state_dict(ckpt["scaler"])
+            except Exception as e:
+                if rank == 0: print(f"[Auto-Resume][WARN] scaler state load failed: {e}")
+
+
+        # 恢复 epoch 与全局步数（下一轮继续）
+        last_epoch = int(ckpt.get("epoch", ckpt_ep))
+        approx_gs  = last_epoch * max(1, len(train_loader))
+        args.global_step = int(ckpt.get("global_step", approx_gs))
+        start_epoch = last_epoch + 1
+
+        if rank == 0:
+            remain = max(0, args.epochs - last_epoch)
+            print(f"[Auto-Resume] Resume from epoch {last_epoch}. "
+                f"Target total epochs = {args.epochs}. Will run {remain} more epoch(s).")
+
+        # 若已训练到/超过目标总轮数，直接结束
+        if start_epoch > args.epochs:
+            if rank == 0:
+                print("[Auto-Resume] Training already completed for the requested total epochs. Nothing to do.")
+            cleanup_distributed()
+            return
+    else:
+        if rank == 0:
+            print("[Auto-Resume] No checkpoint found. Start training from scratch.")
+
+
+        
 
     # ================= 训练 =================
-    for ep in range(1, args.epochs + 1):
+    for ep in range(start_epoch, args.epochs + 1):
         if is_dist and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(ep)
         enc.train(); pf.train(); lf.train()
@@ -420,23 +614,34 @@ def main():
             if rank == 0:
                 ckpt = {
                     "epoch": ep,
+                    # --- 三个子模型 ---
                     "encoder": (enc.module if hasattr(enc, "module") else enc).state_dict(),
                     "pf":      (pf.module  if hasattr(pf,  "module") else pf).state_dict(),
                     "lf":      (lf.module  if hasattr(lf,  "module") else lf).state_dict(),
+                    # --- EMA shadow（评估时可切 EMA） ---
                     "ema_pf": ema_pf.shadow,
                     "ema_lf": ema_lf.shadow,
+                    # --- 关键信息（便于检查 3D/6D 配置等） ---
                     "args": {
                         **vars(args),
-                        "enc_in_channels": enc_in_ch,
-                        "pf_point_dim": pf_point_dim,
+                        "enc_in_channels": enc_in_ch,   # 3 or 6
+                        "pf_point_dim": pf_point_dim,   # 3 or 6
                     },
                     "cond_dim": args.cond_dim,
+                    # --- 断点续训关键：优化器 / AMP / 全局步数 ---
+                    "opt": opt.state_dict(),
+                    "scaler": scaler.state_dict() if args.amp else None,
                     "global_step": args.global_step,
                 }
                 os.makedirs(os.path.join(args.out_dir, "ckpts"), exist_ok=True)
                 torch.save(ckpt, os.path.join(args.out_dir, "ckpts", f"hybrid_ep{ep:04d}.pt"))
+            if is_dist and dist.is_initialized():
+                dist.barrier()
+
+            # 你已有的可视化
             save_val_recon(ep)
             save_val_samples(ep)
+
 
     cleanup_distributed()
 
@@ -542,12 +747,13 @@ python train.py \
   --tdcr_use_norm \
   --latent_dim 128 \
   --pf_backbone hybrid \
+  --lr_pf 1e-4 \
   --ctx_dim 64 --ctx_stage_channels 128 256 256 --ctx_stage_blocks 2 2 2 --ctx_stage_res 64 32 16 \
   --ctx_with_se --ctx_with_global --ctx_voxel_normalize \
-  --lambda_color 1.0\
+  --lambda_color 0.2\
   --use_rgb_in_latent --pointflow_rgb \
   --sample_steps 200 --guidance_scale 0.0 \
   --color_prior uniform \
-  --out_dir runs/pliers_rgb_hybrid
+  --out_dir runs/pliers_0.2rgb_hybrid
 
 '''
