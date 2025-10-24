@@ -315,7 +315,7 @@ class PVCNNVelocityNet(nn.Module):
       - 全局分支（global pooling → MLP → repeat → 与点特征级联）
       - 稳定化：GroupNorm/BatchNorm/SyncBN + 可选冻结 BN
       - 零初始化回归头（Conv1d -> SiLU -> Conv1d(零初始化)）
-    接口与原版保持一致：
+    接口：
       forward(x: (B,N,D), t: (B,), cond: (B,C), cond_drop_mask?: (B,1)) -> (B,N,D)
     """
     def __init__(self,
@@ -329,17 +329,18 @@ class PVCNNVelocityNet(nn.Module):
                  pv_resolution: int = 32,
                  pv_with_se: bool = True,
                  use_xyz_feat: bool = True,
-                 # 新增：多 stage 配置（若为 None 则用上面的旧参数自动推导）
+                 # 多 stage 配置（若为 None 则用上面的旧参数自动推导）
                  pv_channels: Optional[list[int]] = None,
                  pv_blocks_per_stage: Optional[list[int]] = None,
                  pv_resolutions: Optional[list[int]] = None,
-                 # 新增：归一化/FiLM/全局分支/头部细节
+                 # 归一化/FiLM/全局分支/头部细节
                  norm_type: str = "group",        # ["group","batch","syncbn","none"]
                  gn_groups: int = 32,
                  film_one_plus: bool = False,     # False: y*γ+β（zero-init=恒等残差）；True: y*(1+γ)+β
                  with_global: bool = True,
                  head_drop: float = 0.0,
-                 head_zero_init: bool = True):
+                 head_zero_init: bool = True,
+                 voxel_normalize: bool = False):
         super().__init__()
         self.cond_dim = int(cond_dim)
         self.point_dim = int(point_dim)
@@ -353,8 +354,8 @@ class PVCNNVelocityNet(nn.Module):
         self.with_global = bool(with_global)
         self.head_drop = float(head_drop)
         self.head_zero_init = bool(head_zero_init)
-
-        # --------- time/cond embeddings（与原工程一致） ---------
+        self.voxel_normalize = bool(voxel_normalize)
+        # --------- time/cond embedding ---------
         self.t_proj = nn.Linear(emb_dim, emb_dim)
         self.c_proj = nn.Linear(cond_dim if cond_dim > 0 else 1, emb_dim)
         nn.init.normal_(self.t_proj.weight, std=0.02); nn.init.zeros_(self.t_proj.bias)
@@ -400,7 +401,8 @@ class PVCNNVelocityNet(nn.Module):
             self.stages.append(_PVStage(in_c, sc, nb, rs, self.emb_dim, pv_with_se,
                                         self._PVConv, self._SharedMLP,
                                         norm_type=self.norm_type, gn_groups=self.gn_groups,
-                                        film_one_plus=self.film_one_plus))
+                                        film_one_plus=self.film_one_plus,
+                                        voxel_normalize=self.voxel_normalize))
             in_c = sc  # 下一 stage 的输入通道
 
         # --------- 全局分支（末端） ---------
@@ -555,11 +557,13 @@ class _FiLM1d(nn.Module):
 class _PVBlock(nn.Module):
     """ 单个 PVConvBlock：PVConv → SharedMLP → FiLM → 残差 """
     def __init__(self, channels: int, resolution: int, emb_dim: int, with_se: bool,
-                 PVConv, SharedMLP, norm_type: str = "group", gn_groups: int = 32, film_one_plus: bool = False):
+                 PVConv, SharedMLP, norm_type: str = "group", gn_groups: int = 32, film_one_plus: bool = False,
+                 voxel_normalize=False):
         super().__init__()
         self.pvconv = PVConv(channels, channels, kernel_size=3,
                              resolution=int(resolution), with_se=bool(with_se),
-                             normalize=True, eps=1e-6)
+                             normalize=bool(voxel_normalize),
+                             eps=1e-6)
         self.post = SharedMLP(channels, [channels])
         self.film = _FiLM1d(channels, emb_dim, norm_type=norm_type, gn_groups=gn_groups, one_plus=film_one_plus)
 
@@ -572,12 +576,14 @@ class _PVBlock(nn.Module):
 class _PVStage(nn.Module):
     """ Stage: 1×1 SharedMLP 做通道提升 → k×(PVConvBlock) """
     def __init__(self, in_c: int, out_c: int, num_blocks: int, resolution: int, emb_dim: int, with_se: bool,
-                 PVConv, SharedMLP, norm_type: str = "group", gn_groups: int = 32, film_one_plus: bool = False):
+                 PVConv, SharedMLP, norm_type: str = "group", gn_groups: int = 32, film_one_plus: bool = False,
+                 voxel_normalize=False):
         super().__init__()
         self.proj = SharedMLP(in_c, [out_c])
         self.blocks = nn.ModuleList([
             _PVBlock(out_c, resolution, emb_dim, with_se, PVConv, SharedMLP,
-                     norm_type=norm_type, gn_groups=gn_groups, film_one_plus=film_one_plus)
+                     norm_type=norm_type, gn_groups=gn_groups, film_one_plus=film_one_plus,
+                     voxel_normalize=voxel_normalize)
             for _ in range(int(num_blocks))
         ])
 

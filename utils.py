@@ -158,3 +158,50 @@ def save_point_cloud_ply_rgb(xyz: torch.Tensor, rgb: torch.Tensor, path: str):
         f.write("\n".join(header))
         for p, c in zip(xyz_np, rgb_np):
             f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+
+def integrate_point_flow(net_pf, x0: torch.Tensor, cond: torch.Tensor | None,
+                         steps: int, solver: str = "heun", guidance_scale: float = 0.0) -> torch.Tensor:
+    """
+    在 t∈[0,1] 区间用给定求解器积分：dx/dt = v_theta(x,t,cond)
+    net_pf: 具有 guided_velocity(x,t,cond, guidance_scale) 接口（你已有）
+    """
+    x = x0
+    dt = 1.0 / steps
+    B = x.shape[0]
+    if solver == "euler":
+        for k in range(steps):
+            t_mid = x.new_full((B,), (k + 0.5) * dt, dtype=x.dtype)
+            v = net_pf.guided_velocity(x, t_mid, cond, guidance_scale=guidance_scale)
+            x = x + v * dt
+    else:  # Heun / RK2 predictor-corrector
+        for k in range(steps):
+            t0 = x.new_full((B,), k * dt, dtype=x.dtype)
+            v1 = net_pf.guided_velocity(x, t0, cond, guidance_scale=guidance_scale)
+            x_hat = x + v1 * dt
+            t1 = x.new_full((B,), (k + 1) * dt, dtype=x.dtype)
+            v2 = net_pf.guided_velocity(x_hat, t1, cond, guidance_scale=guidance_scale)
+            x = x + 0.5 * dt * (v1 + v2)
+    return x
+
+
+def integrate_latent_flow(net_lf, y0: torch.Tensor, steps: int, solver: str = "heun") -> torch.Tensor:
+    """
+    同上，用于 latent-flow（无条件），调用 net_lf(y,t,cond=None)
+    """
+    y = y0
+    dt = 1.0 / steps
+    B = y.shape[0]
+    if solver == "euler":
+        for k in range(steps):
+            t_mid = y.new_full((B,), (k + 0.5) * dt, dtype=y.dtype)
+            v = net_lf(y, t_mid, cond=None)
+            y = y + v * dt
+    else:
+        for k in range(steps):
+            t0 = y.new_full((B,), k * dt, dtype=y.dtype)
+            v1 = net_lf(y, t0, cond=None)
+            y_hat = y + v1 * dt
+            t1 = y.new_full((B,), (k + 1) * dt, dtype=y.dtype)
+            v2 = net_lf(y_hat, t1, cond=None)
+            y = y + 0.5 * dt * (v1 + v2)
+    return y

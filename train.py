@@ -14,7 +14,7 @@ from models import VelocityNet, ConditionalLatentVelocityNet
 from models import ShapeEncoder, CondAdversary, grad_reverse
 from utils import EMA, seed_all, init_distributed, cleanup_distributed, cosine_lr, \
                   save_point_cloud_ply, save_point_cloud_xyz, count_parameters, \
-                  save_point_cloud_ply_rgb   # 新增
+                  save_point_cloud_ply_rgb
 
 _USE_NEW_AMP = hasattr(torch, "amp") and hasattr(torch.amp, "autocast")
 def make_autocast(enabled: bool, use_bf16: bool):
@@ -83,9 +83,10 @@ def main():
     p.add_argument("--pv_blocks", type=int, default=3)
     p.add_argument("--pv_res", type=int, default=32)
     p.add_argument("--pv_with_se", action="store_true", default=True)
-
     p.add_argument("--pv_norm", type=str, default="group", choices=["group","batch","syncbn","none"])
     p.add_argument("--pv_gn_groups", type=int, default=32)
+    p.add_argument("--pv_voxel_normalize", action="store_true", default=False,
+                help="是否在 PVConv 中启用体素坐标归一化（normalize=True）")
 
     p.add_argument("--pv_num_stages", type=int, default=3,
                 help="仅用于检查/日志；实际由下三项的长度决定")
@@ -99,8 +100,6 @@ def main():
     p.add_argument("--pv_freeze_bn_after", type=int, default=50,
                 help="第几轮开始将 BN 固定为 eval()（仅当 norm=batch/syncbn 时有意义）")
     p.add_argument("--pv_head_drop", type=float, default=0.0)
-
-
     p.add_argument("--use_rgb_in_latent", action="store_true", default=True,
                    help="Encoder 的输入是否拼 rgb（若数据有 rgb）")
     p.add_argument("--pointflow_rgb", action="store_true", default=False,
@@ -116,6 +115,16 @@ def main():
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip_norm", type=float, default=1.0)
+
+    # ---- Sampling / EMA ----
+    p.add_argument("--sample_solver", type=str, choices=["euler", "heun"], default="heun",
+                help="采样积分器：euler 或 heun(RK2)")
+    p.add_argument("--eval_sample_steps", type=int, default=0,
+                help="若>0，则验证阶段覆盖 --sample_steps（例如 200/400）")
+    p.add_argument("--ema_decay", type=float, default=0.999, help="EMA 衰减系数")
+    p.add_argument("--ema_eval", action="store_true", default=True,
+                help="验证/可视化时使用 EMA 权重进行前向")
+
 
     # FM priors
     p.add_argument("--point_prior_std", type=float, default=1.0, help="XYZ 高斯先验的 std")
@@ -214,7 +223,8 @@ def main():
             film_one_plus=False,      # Zero-init 残差更稳；如需 1+γ 方式可改 True
             with_global=True,
             head_drop=args.pv_head_drop,
-            head_zero_init=True
+            head_zero_init=True,
+            voxel_normalize=getattr(args, "pv_voxel_normalize", False)
         ).to(args.device)
     else:
         pf = VelocityNet(cond_dim=pf_cond_dim, width=args.pf_width, depth=args.pf_depth,
@@ -224,7 +234,7 @@ def main():
     
     lf = ConditionalLatentVelocityNet(args.latent_dim, cond_dim=0, width=args.lf_width,
                                       depth=args.lf_depth, emb_dim=args.lf_emb_dim).to(args.device)
-    ema_pf = EMA(pf, decay=0.999); ema_lf = EMA(lf, decay=0.999)
+    ema_pf = EMA(pf, decay=args.ema_decay); ema_lf = EMA(lf, decay=args.ema_decay)
     pf.ema_shadow = ema_pf.shadow; lf.ema_shadow = ema_lf.shadow
     adv = CondAdversary(args.latent_dim, cond_dim=args.cond_dim, width=256, depth=3).to(args.device)
 
@@ -333,52 +343,145 @@ def main():
             print(f"[Val-Recon ep{ep:04d}] GT-encode(z) -> PF(+joint)  CD = {cd:.4f}（Pred 颜色为模型直接生成）")
 
     # --------- 可视化：随机 z（也直接输出预测颜色） ---------
+    # --------- 可视化：随机 z（也直接输出预测颜色） ---------
     def save_val_samples(ep: int):
+        """
+        验证采样（随机 z）：
+          - 默认使用 EMA 权重
+          - 采样器使用 Heun(RK2)，并允许更大步数
+          - 若外部已提供 integrate_* / use_ema_weights，则优先使用；否则回退到本地实现
+        """
+        from contextlib import nullcontext
+
         net_pf = pf.module if hasattr(pf, "module") else pf
         net_lf = lf.module if hasattr(lf, "module") else lf
         net_pf.eval(); net_lf.eval()
 
-        pts = val_batch["test_points"].to(args.device).float()
+        # --------- 读取验证 batch ---------
+        pts = val_batch["test_points"].to(args.device).float()  # (B,N,3)
         rgb = val_batch.get("test_rgb", None)
-        if rgb is not None: rgb = rgb.to(args.device).float()
+        if rgb is not None:
+            rgb = rgb.to(args.device).float()                   # (B,N,3) in [0,1]
         cond_j = val_batch.get("cond", None)
-        if cond_j is not None: cond_j = cond_j.to(args.device).float()
+        if cond_j is not None:
+            cond_j = cond_j.to(args.device).float()
 
-        with torch.no_grad():
-            eps_z = torch.randn((pts.shape[0], args.latent_dim), device=args.device) * args.latent_prior_std
-            z = net_lf.euler_sample(eps_z, cond=None, steps=args.sample_steps)  # sample z
-            # prior（3D 或 6D）
-            if pf_point_dim == 6 and rgb is not None:
-                target_pf = torch.cat([pts, rgb], dim=-1)  # 只为 shape
+        B = pts.shape[0]
+
+        # --------- 采样超参（若未在 argparse 中定义，使用默认值） ---------
+        steps_lf = int(getattr(args, "sample_steps_lf", args.sample_steps))
+        steps_pf = int(getattr(args, "sample_steps_pf", args.sample_steps))
+        method_lf = str(getattr(args, "sample_method_lf", "heun")).lower()
+        method_pf = str(getattr(args, "sample_method_pf", "heun")).lower()
+        use_ema  = bool(getattr(args, "use_ema_for_eval", True))
+
+        # --------- EMA 权重上下文 ---------
+        # 优先使用你实现的 use_ema_weights(shadow)；若没有，则使用本地回退
+        try:
+            from utils import use_ema_weights as _use_ema_weights  # 你若已实现，会走这里
+            ema_ctx_pf = _use_ema_weights(net_pf, ema_pf.shadow) if use_ema else nullcontext()
+            ema_ctx_lf = _use_ema_weights(net_lf, ema_lf.shadow) if use_ema else nullcontext()
+        except Exception:
+            # 本地回退：进入时把 EMA 参数拷到模型，退出时还原
+            class _SwapEMA:
+                def __init__(self, module, shadow):
+                    self.m = module; self.shadow = shadow; self.back = None
+                def __enter__(self):
+                    sd = self.m.state_dict()
+                    # 只备份与 EMA 对应的浮点参数/缓冲
+                    self.back = {k: v.detach().clone() for k, v in sd.items()
+                                 if torch.is_tensor(v) and v.dtype.is_floating_point}
+                    for k, v_ema in self.shadow.items():
+                        if k in sd and torch.is_tensor(sd[k]) and sd[k].dtype.is_floating_point:
+                            sd[k].copy_(v_ema.to(device=sd[k].device, dtype=sd[k].dtype))
+                    return self.m
+                def __exit__(self, exc_type, exc, tb):
+                    sd = self.m.state_dict()
+                    for k, v in self.back.items():
+                        sd[k].copy_(v)
+            ema_ctx_pf = _SwapEMA(net_pf, ema_pf.shadow) if use_ema else nullcontext()
+            ema_ctx_lf = _SwapEMA(net_lf, ema_lf.shadow) if use_ema else nullcontext()
+
+        try:
+            from utils import integrate_point_flow as _integrate_pf, integrate_latent_flow as _integrate_lf
+        except Exception:
+            assert("integrate fail")
+
+        # --------- 采样（带 EMA 上下文） ---------
+        with torch.no_grad(), ema_ctx_pf, ema_ctx_lf:
+            # 1) latent:  y0~N(0, σ^2 I) → z  （无条件）
+            eps_z = torch.randn((B, args.latent_dim), device=args.device, dtype=pts.dtype) * args.latent_prior_std
+            z = _integrate_lf(net_lf, eps_z, steps=steps_lf, solver=method_lf)  # (B, Dz)
+
+            # 2) point-flow:  x0 ~ prior → data
+            if (pf_point_dim == 6) and (rgb is not None):
+                target_pf = torch.cat([pts, rgb], dim=-1)     # 只用来提供目标形状
             else:
                 target_pf = pts
-            x = make_pf_prior_like(target_pf)
-            dt = 1.0 / args.sample_steps
-            for i in range(args.sample_steps):
-                t = torch.full((x.shape[0],), (i + 0.5)*dt, device=x.device, dtype=x.dtype)
-                cond_full = torch.cat([z, cond_j], dim=1) if cond_j is not None else z
-                v = net_pf.guided_velocity(x, t, cond_full, guidance_scale=args.guidance_scale)
-                x = x + v * dt
+            x0 = make_pf_prior_like(target_pf)                # (B,N,3/6)
+
+            cond_full = torch.cat([z, cond_j], dim=1) if cond_j is not None else z
+            x = _integrate_pf(net_pf, x0, steps=steps_pf, solver=method_pf,
+                              cond=cond_full, guidance_scale=args.guidance_scale)
+
+            # 3) 计算 CD
             cd = chamfer_l2(x[:, :, :3] if x.shape[-1] == 6 else x, pts).mean().item()
 
+        # --------- 保存结果 ---------
         if rank == 0:
             out_dir = os.path.join(args.out_dir, f"samples_ep{ep:04d}")
             os.makedirs(out_dir, exist_ok=True)
             for i in range(min(args.vis_count, x.shape[0])):
                 if x.shape[-1] == 6:
-                    save_point_cloud_ply_rgb(x[i, :, :3], x[i, :, 3:].clamp(0,1), os.path.join(out_dir, f"pred_{i}.ply"))
+                    save_point_cloud_ply_rgb(x[i, :, :3], x[i, :, 3:].clamp(0, 1), os.path.join(out_dir, f"pred_{i}.ply"))
                     if rgb is not None:
-                        save_point_cloud_ply_rgb(pts[i], rgb[i].clamp(0,1), os.path.join(out_dir, f"gt_{i}.ply"))
+                        save_point_cloud_ply_rgb(pts[i], rgb[i].clamp(0, 1), os.path.join(out_dir, f"gt_{i}.ply"))
                     else:
                         save_point_cloud_ply(pts[i], os.path.join(out_dir, f"gt_{i}.ply"))
                 else:
                     save_point_cloud_ply(x[i], os.path.join(out_dir, f"pred_{i}.ply"))
                     save_point_cloud_ply(pts[i], os.path.join(out_dir, f"gt_{i}.ply"))
-            print(f"[Val ep{ep:04d}] random-sample vs single-GT CD = {cd:.4f}（Pred 颜色为模型直接生成）")
+
+            msg = (f"[Val ep{ep:04d}] (EMA={use_ema}) latent:{method_lf}/{steps_lf}  "
+                   f"point:{method_pf}/{steps_pf}  CD = {cd:.4f}（Pred 颜色为模型直接生成）")
+            print(msg)
+
 
     # =========================
     # [Auto-Resume] 自动恢复段 + 设备修复
     # =========================
+
+    from contextlib import contextmanager
+    @contextmanager
+    def use_ema_weights(module: nn.Module, ema_shadow: dict | None, enabled: bool = True):
+        """
+        将 module 的浮点参数/缓冲区临时替换为 ema_shadow 中的值；退出时还原。
+        - 仅在 enabled=True 且 ema_shadow 存在时生效
+        - DDP 情况下请传入 pf.module / lf.module
+        """
+        if (not enabled) or (ema_shadow is None):
+            yield module
+            return
+        device = next(module.parameters()).device
+        saved_params, saved_bufs = {}, {}
+        # 参数
+        for name, p in module.named_parameters(recurse=True):
+            if name in ema_shadow and torch.is_tensor(ema_shadow[name]) and p.dtype.is_floating_point:
+                saved_params[name] = p.data.detach().clone()
+                p.data.copy_(ema_shadow[name].to(device=device, dtype=p.dtype))
+        # 缓冲区（如 BN 的 running_mean/var；GN 没这个但兼容）
+        for name, b in module.named_buffers(recurse=True):
+            if name in ema_shadow and torch.is_tensor(ema_shadow[name]) and b.dtype.is_floating_point:
+                saved_bufs[name] = b.data.detach().clone()
+                b.data.copy_(ema_shadow[name].to(device=device, dtype=b.dtype))
+        try:
+            yield module
+        finally:
+            for name, p in module.named_parameters(recurse=True):
+                if name in saved_params: p.data.copy_(saved_params[name])
+            for name, b in module.named_buffers(recurse=True):
+                if name in saved_bufs: b.data.copy_(saved_bufs[name])
+
     def _find_latest_ckpt(ckpt_dir: str):
         """返回 (path, epoch)；找不到则 (None, 0)。"""
         if not os.path.isdir(ckpt_dir):
