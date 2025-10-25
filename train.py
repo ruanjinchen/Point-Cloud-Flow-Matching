@@ -151,6 +151,7 @@ def main():
  
     p.add_argument("--ctx_t_gate_tau", type=float, default=0.8, help="t-门控的阈值（越大表示更晚启用PV上下文）")
     p.add_argument("--ctx_t_gate_k", type=float, default=10.0, help="t-门控的陡峭度（sigmoid斜率）")
+    p.add_argument("--cfg_drop_warmup_epochs", type=int, default=100, help="CFG条件dropout线性升温的epoch数；前期不drop，逐步升到cfg_drop_p")
 
     # ========== Sampling / CFG / EMA ==========
     p.add_argument("--sample_steps", type=int, default=50)
@@ -607,10 +608,14 @@ def main():
 
             # ---- 条件拼接（与训练保持一致）----
             cond_full = z if cond_j is None else torch.cat([z, cond_j], dim=1)
+
             cond_drop_mask = None
             if args.cfg_drop_p > 0.0 and cond_full is not None:
-                drop = (torch.rand(B, device=args.device) < args.cfg_drop_p).to(data_pf.dtype)
-                cond_drop_mask = drop[:, None]
+                # 线性升温：前 args.cfg_drop_warmup_epochs 个epoch内从0 -> cfg_drop_p
+                drop_p_now = float(args.cfg_drop_p) * min(1.0, max(0.0, (ep / max(1, args.cfg_drop_warmup_epochs))))
+                if drop_p_now > 0.0:
+                    drop = (torch.rand(B, device=args.device) < drop_p_now).to(data_pf.dtype)
+                    cond_drop_mask = drop[:, None]
 
             with make_autocast(enabled=args.amp, use_bf16=args.use_bf16):
                 pred_v = model_pf(x_t, t_pts, cond_full, cond_drop_mask=cond_drop_mask)
