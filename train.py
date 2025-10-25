@@ -142,7 +142,8 @@ def main():
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip_norm", type=float, default=1.0)
-
+    p.add_argument("--t_beta_a", type=float, default=2.0, help="t ~ Beta(a, 1). a>1 时靠近 1 更稠密（默认 2.0）")
+    p.add_argument("--geom_warmup_epochs", type=int, default=200, help="前多少个 epoch 仅训练几何（颜色维度置零且不计入损失）")
     # ========== FM priors ==========
     p.add_argument("--point_prior_std", type=float, default=1.0, help="XYZ 高斯先验的 std")
     p.add_argument("--latent_prior_std", type=float, default=1.0)
@@ -537,6 +538,9 @@ def main():
 
     # ================= 训练 =================
     for ep in range(start_epoch, args.epochs + 1):
+        # --- 本轮是否启用颜色（两阶段训练）：预热阶段仅几何 ---
+        use_rgb_this_epoch = (ep > args.geom_warmup_epochs) and (args.pointflow_rgb and args.has_rgb)
+
         if is_dist and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(ep)
         enc.train(); pf.train(); lf.train()
@@ -552,18 +556,39 @@ def main():
                 cond_j = cond_j.to(args.device).float()
 
             # ---- 编码器 ----
-            enc_in = pts if (enc_in_ch == 3 or rgb is None) else torch.cat([pts, rgb], dim=-1)
+            # 预热阶段建议编码器也只看几何（避免颜色“帮忙”过多）
+            enc_in = pts if ((enc_in_ch == 3) or (rgb is None) or (not use_rgb_this_epoch)) \
+                        else torch.cat([pts, rgb], dim=-1)
             with make_autocast(enabled=args.amp, use_bf16=args.use_bf16):
                 z, _ = enc(enc_in)   # (B, Dz)
 
             # ---- Point-flow FM（3D 或 6D）----
-            data_pf = torch.cat([pts, rgb], dim=-1) if (pf_point_dim == 6 and rgb is not None) else pts
+            # 6D 情况下：预热阶段把颜色维度置零（输入与目标都为 0，用于“几何先行”）
+            if pf_point_dim == 6:
+                if (rgb is not None) and use_rgb_this_epoch:
+                    data_pf = torch.cat([pts, rgb], dim=-1)                     # (B,N,6)
+                    # 颜色先验按你的设置（gauss/uniform/zeros）
+                    z_pts = make_pf_prior_like(data_pf)                          # (B,N,6)
+                else:
+                    # 预热阶段：颜色维度恒为 0；先验也置 0（避免噪声干扰几何）
+                    zeros_rgb = torch.zeros_like(pts)
+                    data_pf = torch.cat([pts, zeros_rgb], dim=-1)                # (B,N,6)
+                    z_pts = torch.empty_like(data_pf)
+                    z_pts[..., :3] = torch.randn_like(pts) * args.point_prior_std
+                    z_pts[..., 3:] = 0.0
+            else:
+                data_pf = pts
+                z_pts  = torch.randn_like(data_pf) * args.point_prior_std
+
             B, N, D = data_pf.shape
-            z_pts  = make_pf_prior_like(data_pf)                         # same shape
-            t_pts  = torch.rand(B, device=args.device, dtype=data_pf.dtype)
-            x_t    = (1.0 - t_pts)[:, None, None] * z_pts + t_pts[:, None, None] * data_pf
+
+            # ---- t 采样向 1 倾斜（Beta）----
+            beta = torch.distributions.Beta(concentration1=args.t_beta_a, concentration0=1.0)
+            t_pts = beta.sample((B,)).to(device=args.device, dtype=data_pf.dtype)  # (B,)
+            x_t   = (1.0 - t_pts)[:, None, None] * z_pts + t_pts[:, None, None] * data_pf
             target_v = (data_pf - z_pts)
 
+            # ---- 条件拼接（与训练保持一致）----
             cond_full = z if cond_j is None else torch.cat([z, cond_j], dim=1)
             cond_drop_mask = None
             if args.cfg_drop_p > 0.0 and cond_full is not None:
@@ -573,21 +598,30 @@ def main():
             with make_autocast(enabled=args.amp, use_bf16=args.use_bf16):
                 pred_v = model_pf(x_t, t_pts, cond_full, cond_drop_mask=cond_drop_mask)
                 if D == 6:
-                    loss_pos = F.mse_loss(pred_v[..., :3], target_v[..., :3])
-                    loss_col = F.mse_loss(pred_v[..., 3:], target_v[..., 3:])
-                    loss_point = loss_pos + args.lambda_color * loss_col
+                    if (rgb is not None) and use_rgb_this_epoch:
+                        # 正常 6D：几何 + 颜色
+                        loss_pos = F.mse_loss(pred_v[..., :3], target_v[..., :3])
+                        loss_col = F.mse_loss(pred_v[..., 3:], target_v[..., 3:])
+                        loss_point = loss_pos + args.lambda_color * loss_col
+                    else:
+                        # 预热：仅几何监督
+                        loss_point = F.mse_loss(pred_v[..., :3], target_v[..., :3])
                 else:
                     loss_point = F.mse_loss(pred_v, target_v)
+
 
             # ---- Latent-flow FM（无条件）----
             with torch.no_grad(): z_det = z.detach()
             eps_z = torch.randn_like(z_det) * args.latent_prior_std
-            t_z   = torch.rand(B, device=args.device, dtype=z_det.dtype)
-            y_t   = (1.0 - t_z)[:, None] * eps_z + t_z[:, None] * z_det
+            # t_z 旧：torch.rand(...)
+            beta_latent = torch.distributions.Beta(concentration1=args.t_beta_a, concentration0=1.0)
+            t_z = beta_latent.sample((B,)).to(device=args.device, dtype=z_det.dtype)
+            y_t = (1.0 - t_z)[:, None] * eps_z + t_z[:, None] * z_det
             target_v_z = (z_det - eps_z)
             with make_autocast(enabled=args.amp, use_bf16=args.use_bf16):
                 pred_v_z = lf(y_t, t_z, cond=None)
                 loss_latent = F.mse_loss(pred_v_z, target_v_z)
+
 
             # ---- 总损失 ----
             loss = args.lambda_point * loss_point + args.lambda_latent * loss_latent
@@ -613,6 +647,7 @@ def main():
             if pbar is not None:
                 pbar.set_postfix(lp=float(loss_point.detach().cpu()), lz=float(loss_latent.detach().cpu()))
                 pbar.update(1)
+        
         if pbar is not None: pbar.close()
 
         # ---- Save & Eval ----

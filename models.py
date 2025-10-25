@@ -392,12 +392,7 @@ class _PVStage(nn.Module):
 class ContextNet(nn.Module):
     """
     多尺度 PVConv 金字塔，输出每点 ctx 特征。
-    - 输入：(B,N,3 or 6)
-    - 输出：(B,N,ctx_dim)
-    设计要点：
-      * 多 stage（分辨率递减）：提升上下文感受野，利于细长与末端细节
-      * 全程 FiLM(t,cond)，时间/条件贯穿所有 stage
-      * 可选全局通道（max-pool -> MLP -> repeat），增强全局一致性
+    + t-门控的上下文融合：小 t 用全局(t,cond)上下文，大 t 用 PVConv 多尺度上下文
     """
     def __init__(self,
                  in_point_dim: int,              # 3 / 6
@@ -411,13 +406,20 @@ class ContextNet(nn.Module):
                  norm_type: str = "group",
                  gn_groups: int = 32,
                  with_global: bool = True,
-                 voxel_normalize: bool = True):
+                 voxel_normalize: bool = True,
+                 # ---- 新增：t-门控参数 ----
+                 use_t_gate: bool = True,
+                 t_gate_k: float = 10.0,
+                 t_gate_tau: float = 0.4):
         super().__init__()
         assert len(stage_channels) == len(stage_blocks) == len(stage_res)
         self.in_point_dim = int(in_point_dim)
         self.emb_dim = int(emb_dim)
         self.ctx_dim = int(ctx_dim)
         self.with_global = bool(with_global)
+        self.use_t_gate = bool(use_t_gate)
+        self.t_gate_k = float(t_gate_k)
+        self.t_gate_tau = float(t_gate_tau)
 
         self.use_xyz = True
         self.use_rgb = (self.in_point_dim == 6)
@@ -453,8 +455,8 @@ class ContextNet(nn.Module):
                     nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                     nn.init.zeros_(m.bias)
 
-        # 输出头：把多尺度末端特征 -> ctx_dim
-        self.stage_channels = list(stage_channels)  # 记录以便 forward 使用
+        # 输出头：多尺度汇聚 -> ctx_dim
+        self.stage_channels = list(stage_channels)
         head_in = sum(self.stage_channels) + (self.stage_channels[-1] if self.with_global else 0)
         self.head_pre = nn.Conv1d(head_in, self.stage_channels[-1], 1, bias=True)
         self.head_norm = _make_norm(norm_type, self.stage_channels[-1], gn_groups)
@@ -467,6 +469,15 @@ class ContextNet(nn.Module):
 
         self.norm_type = norm_type
         self.gn_groups = int(gn_groups)
+
+        # ---- 新增：仅由 (t,cond) 生成的全局上下文（与 t-门控配合）----
+        self.ctx_from_emb = nn.Sequential(
+            nn.Linear(self.emb_dim, self.ctx_dim)
+        )
+        for m in self.ctx_from_emb:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.zeros_(m.bias)
 
     def _t_emb(self, t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         if t.dim() == 1:
@@ -482,11 +493,12 @@ class ContextNet(nn.Module):
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        x: (B,N,3/6)  ->  ctx: (B,N,ctx_dim)
+        x: (B,N,3/6) -> ctx: (B,N,ctx_dim)
         """
         B, N, D = x.shape
         coords = x[..., :3].permute(0, 2, 1).contiguous()  # (B,3,N)
-        # emb
+
+        # emb (t, cond)
         emb = self._t_emb(t, x.dtype) + self._c_emb(x, cond)  # (B,E)
 
         # stem feats = [emb | xyz | (rgb)]
@@ -497,30 +509,38 @@ class ContextNet(nn.Module):
             feats.append(x[..., 3:].permute(0, 2, 1).contiguous())
         feats = torch.cat(feats, dim=1)  # (B,C_in,N)
 
-        # 为了稳定 PVConv 的数值，强制在 FP32 下计算
+        # FP32 稳定计算
         with torch.amp.autocast("cuda", enabled=False):
             f, c = feats.float(), coords.float()
             emb32 = emb.float()
 
-            ms_feats = []  # <<< 新增：收集每个阶段的特征 (B,C_i,N)
-            for si, stage in enumerate(self.stages):
+            ms_feats = []
+            for stage in self.stages:
                 f, c = stage(f, c, emb32)
-                ms_feats.append(f)  # (B,C_i,N)
+                ms_feats.append(f)                      # (B,C_i,N)
 
-            # 可选全局分支：用最后一层通道
             if self.with_global:
-                g = f.max(dim=-1).values               # (B,C_last)
-                g = self.global_mlp(g)                 # (B,C_last)
-                g = g[:, :, None].expand_as(f)         # (B,C_last,N)
-                ms_feats.append(g)                     # 直接当作另一“尺度”通道堆叠
+                g = f.max(dim=-1).values                # (B,C_last)
+                g = self.global_mlp(g)                  # (B,C_last)
+                g = g[:, :, None].expand_as(f)          # (B,C_last,N)
+                ms_feats.append(g)
 
-            f_cat = torch.cat(ms_feats, dim=1)         # (B, sum(C_i)+C_last(if global), N)
+            f_cat = torch.cat(ms_feats, dim=1)          # (B, sum(C_i)+..., N)
 
             h = self.head_pre(f_cat)
             h = self.head_act(self.head_norm(h))
-            ctx32 = self.head_out(h)                   # (B,ctx_dim,N)
+            ctx_pv = self.head_out(h).permute(0, 2, 1)  # (B,N,ctx_dim)  —— PVConv 多尺度上下文
 
-        return ctx32.permute(0, 2, 1).contiguous().to(x.dtype)
+            if self.use_t_gate:
+                # 从 emb 生成“全局上下文”，与 t-门控插值
+                ctx_glb = self.ctx_from_emb(emb32)                      # (B,ctx_dim)
+                ctx_glb = ctx_glb[:, None, :].expand(B, N, -1)          # (B,N,ctx_dim)
+                alpha = torch.sigmoid(self.t_gate_k * (t.view(B, 1, 1).float() - self.t_gate_tau))
+                ctx = alpha * ctx_pv + (1.0 - alpha) * ctx_glb
+            else:
+                ctx = ctx_pv
+
+        return ctx.to(x.dtype)
 
 
 class VelocityNetWithContext(nn.Module):
