@@ -793,8 +793,8 @@ python train.py \
   --out_dir runs/box_rgb
 
 
-
-python train.py \
+export CUDA_VISIBLE_DEVICES=4,5
+torchrun --standalone --nproc_per_node=2 train.py \
   --dataset_type partnet_h5 \
   --data_dir ../Dataset/partnet/Pliers \
   --batch_size 8 --epochs 3000 --save_every 10 \

@@ -624,6 +624,10 @@ class HybridMLP(nn.Module):
                  gn_groups: int = 32,
                  with_global: bool = True,
                  voxel_normalize: bool = True,
+                 # t‑门控（可调入口；默认更保守）
+                 use_t_gate: bool = True,
+                 t_gate_k: float = 10.0,
+                 t_gate_tau: float = 0.8,
                  # 逐点 MLP 头
                  pf_width: int = 512,
                  pf_depth: int = 6,
@@ -639,6 +643,8 @@ class HybridMLP(nn.Module):
             stage_channels=list(stage_channels), stage_blocks=list(stage_blocks), stage_res=list(stage_res),
             with_se=with_se, norm_type=norm_type, gn_groups=gn_groups,
             with_global=with_global, voxel_normalize=voxel_normalize
+            # 透传 t‑门控
+            use_t_gate=use_t_gate, t_gate_k=t_gate_k, t_gate_tau=t_gate_tau
         )
         # 逐点头
         self.head = VelocityNetWithContext(
