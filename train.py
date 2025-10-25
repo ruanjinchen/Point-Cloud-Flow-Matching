@@ -557,8 +557,22 @@ def main():
 
             # ---- 编码器 ----
             # 预热阶段建议编码器也只看几何（避免颜色“帮忙”过多）
-            enc_in = pts if ((enc_in_ch == 3) or (rgb is None) or (not use_rgb_this_epoch)) \
-                        else torch.cat([pts, rgb], dim=-1)
+            # 若 enc_in_ch == 6，则无论是否预热，都保证编码器输入为 6 维；
+            # 预热阶段把 rgb 三维置零，避免颜色干扰但不改通道数。
+            if enc_in_ch == 6:
+                if rgb is not None:
+                    if use_rgb_this_epoch:
+                        enc_in = torch.cat([pts, rgb], dim=-1)          # (B,N,6)
+                    else:
+                        zeros_rgb = torch.zeros_like(pts)                # (B,N,3)
+                        enc_in = torch.cat([pts, zeros_rgb], dim=-1)     # (B,N,6) — 预热: rgb=0
+                else:
+                    # 理论上 has_rgb=True 时不会走到这；兜底仍然补零
+                    zeros_rgb = torch.zeros_like(pts)
+                    enc_in = torch.cat([pts, zeros_rgb], dim=-1)
+            else:
+                enc_in = pts                                             # (B,N,3)
+
             with make_autocast(enabled=args.amp, use_bf16=args.use_bf16):
                 z, _ = enc(enc_in)   # (B, Dz)
 
@@ -795,6 +809,6 @@ python train.py \
   --use_rgb_in_latent --pointflow_rgb \
   --sample_steps 100 --guidance_scale 0.0 \
   --color_prior uniform \
-  --out_dir runs/pliers_0.2rgb_hybrid_ema
+  --out_dir runs/pliers_step_rgb
 
 '''
