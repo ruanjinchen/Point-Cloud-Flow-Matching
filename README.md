@@ -38,7 +38,7 @@ conda install -y --override-channels --solver=libmamba \
 ### PVCNN
 ```sh
 cd third_party/pvcnn
-export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0;12.0"
+export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0"
 export CUDA_HOME="$CONDA_PREFIX"
 export CPATH="$CONDA_PREFIX/include:$CONDA_PREFIX/targets/x86_64-linux/include:${CPATH}"
 export LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/targets/x86_64-linux/lib:${LIBRARY_PATH}"
@@ -79,7 +79,7 @@ export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
 export CXX=/usr/bin/g++
-export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0;12.0"
+export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0"
 export MAX_JOBS=16
 
 pip install -v .
