@@ -454,11 +454,12 @@ class ContextNet(nn.Module):
                     nn.init.zeros_(m.bias)
 
         # 输出头：把多尺度末端特征 -> ctx_dim
-        head_in = stage_channels[-1] * (2 if self.with_global else 1)
-        self.head_pre = nn.Conv1d(head_in, stage_channels[-1], 1, bias=True)
-        self.head_norm = _make_norm(norm_type, stage_channels[-1], gn_groups)
+        self.stage_channels = list(stage_channels)  # 记录以便 forward 使用
+        head_in = sum(self.stage_channels) + (self.stage_channels[-1] if self.with_global else 0)
+        self.head_pre = nn.Conv1d(head_in, self.stage_channels[-1], 1, bias=True)
+        self.head_norm = _make_norm(norm_type, self.stage_channels[-1], gn_groups)
         self.head_act  = nn.SiLU()
-        self.head_out  = nn.Conv1d(stage_channels[-1], ctx_dim, 1, bias=True)
+        self.head_out  = nn.Conv1d(self.stage_channels[-1], ctx_dim, 1, bias=True)
 
         nn.init.kaiming_normal_(self.head_pre.weight, nonlinearity="relu")
         nn.init.zeros_(self.head_pre.bias)
@@ -501,20 +502,25 @@ class ContextNet(nn.Module):
             f, c = feats.float(), coords.float()
             emb32 = emb.float()
 
-            for stage in self.stages:
+            ms_feats = []  # <<< 新增：收集每个阶段的特征 (B,C_i,N)
+            for si, stage in enumerate(self.stages):
                 f, c = stage(f, c, emb32)
+                ms_feats.append(f)  # (B,C_i,N)
 
+            # 可选全局分支：用最后一层通道
             if self.with_global:
-                g = f.max(dim=-1).values                    # (B,C_last)
-                g = self.global_mlp(g)                      # (B,C_last)
-                g = g[:, :, None].expand_as(f)              # (B,C_last,N)
-                f = torch.cat([f, g], dim=1)                # (B,2*C_last,N)
+                g = f.max(dim=-1).values               # (B,C_last)
+                g = self.global_mlp(g)                 # (B,C_last)
+                g = g[:, :, None].expand_as(f)         # (B,C_last,N)
+                ms_feats.append(g)                     # 直接当作另一“尺度”通道堆叠
 
-            h = self.head_pre(f)
+            f_cat = torch.cat(ms_feats, dim=1)         # (B, sum(C_i)+C_last(if global), N)
+
+            h = self.head_pre(f_cat)
             h = self.head_act(self.head_norm(h))
-            ctx32 = self.head_out(h)                        # (B,ctx_dim,N)
+            ctx32 = self.head_out(h)                   # (B,ctx_dim,N)
 
-        return ctx32.permute(0, 2, 1).contiguous().to(x.dtype)  # (B,N,ctx_dim)
+        return ctx32.permute(0, 2, 1).contiguous().to(x.dtype)
 
 
 class VelocityNetWithContext(nn.Module):

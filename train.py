@@ -239,8 +239,14 @@ def main():
         lf = DDP(lf, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False, find_unused_parameters=False)
 
     # ---- optim / scaler ----
-    opt = torch.optim.AdamW(list(enc.parameters()) + list(pf.parameters()) + list(lf.parameters()),
-                            lr=args.lr_pf, weight_decay=args.weight_decay)
+    # opt = torch.optim.AdamW(list(enc.parameters()) + list(pf.parameters()) + list(lf.parameters()),
+    #                         lr=args.lr_pf, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW([
+        {"params": enc.parameters(), "lr": args.lr_enc},
+        {"params": pf.parameters(),  "lr": args.lr_pf},
+        {"params": lf.parameters(),  "lr": args.lr_lf},
+    ], weight_decay=args.weight_decay)
+
     scaler = make_scaler(enabled=args.amp)
 
     args.total_steps = args.epochs * max(1, len(train_loader))
@@ -750,10 +756,10 @@ python train.py \
   --lr_pf 1e-4 \
   --ctx_dim 64 --ctx_stage_channels 128 256 256 --ctx_stage_blocks 2 2 2 --ctx_stage_res 64 32 16 \
   --ctx_with_se --ctx_with_global --ctx_voxel_normalize \
-  --lambda_color 0.2\
+  --lambda_color 0.1\
   --use_rgb_in_latent --pointflow_rgb \
-  --sample_steps 200 --guidance_scale 0.0 \
+  --sample_steps 100 --guidance_scale 0.0 \
   --color_prior uniform \
-  --out_dir runs/pliers_0.2rgb_hybrid
+  --out_dir runs/pliers_0.2rgb_hybrid_ema
 
 '''
