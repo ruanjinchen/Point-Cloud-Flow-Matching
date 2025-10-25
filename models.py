@@ -642,7 +642,7 @@ class HybridMLP(nn.Module):
             in_point_dim=point_dim, cond_dim=cond_dim, emb_dim=ctx_emb_dim, ctx_dim=ctx_dim,
             stage_channels=list(stage_channels), stage_blocks=list(stage_blocks), stage_res=list(stage_res),
             with_se=with_se, norm_type=norm_type, gn_groups=gn_groups,
-            with_global=with_global, voxel_normalize=voxel_normalize
+            with_global=with_global, voxel_normalize=voxel_normalize,
             # 透传 t‑门控
             use_t_gate=use_t_gate, t_gate_k=t_gate_k, t_gate_tau=t_gate_tau
         )
