@@ -657,8 +657,14 @@ def main():
 
             # ---- LR schedule ----
             if args.use_cosine_lr:
-                lr_now = cosine_lr(args.global_step, args.total_steps, args.lr_pf, args.min_lr, args.warmup_steps)
-                for pg in opt.param_groups: pg['lr'] = lr_now
+                lr_enc_now = cosine_lr(args.global_step, args.total_steps, args.lr_enc, args.min_lr, args.warmup_steps)
+                lr_pf_now  = cosine_lr(args.global_step, args.total_steps, args.lr_pf,  args.min_lr, args.warmup_steps)
+                lr_lf_now  = cosine_lr(args.global_step, args.total_steps, args.lr_lf,  args.min_lr, args.warmup_steps)
+                # 注意 param_groups 顺序：enc / pf / lf
+                opt.param_groups[0]['lr'] = lr_enc_now
+                opt.param_groups[1]['lr'] = lr_pf_now
+                opt.param_groups[2]['lr'] = lr_lf_now
+
             args.global_step += 1
 
             if pbar is not None:
