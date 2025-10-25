@@ -126,11 +126,9 @@ def main():
     p.add_argument("--ctx_with_global", action="store_true", default=True)
     p.add_argument("--ctx_voxel_normalize", action="store_true", default=True)  # 强烈建议 True
 
-    # 颜色开关（不想学颜色就关掉）
-    p.add_argument("--use_rgb_in_latent", action="store_true", default=True,
-                   help="Encoder 输入是否拼 rgb（若数据有 rgb）")
-    p.add_argument("--pointflow_rgb", action="store_true", default=True,
-                   help="Point-flow 是否在 6D(xyz+rgb) 上学习/采样（若数据有 rgb）")
+    # 颜色开关
+    p.add_argument("--use_rgb_in_latent", action="store_true", default=True, help="Encoder 输入是否拼 rgb（若数据有 rgb）")
+    p.add_argument("--pointflow_rgb", action="store_true", default=True, help="Point-flow 是否在 6D(xyz+rgb) 上学习/采样（若数据有 rgb）")
 
     # ========== Training ==========
     p.add_argument("--epochs", type=int, default=300)
@@ -150,6 +148,9 @@ def main():
     p.add_argument("--color_prior", type=str, choices=["gauss","uniform","zeros"], default="gauss",
                    help="PF 中 RGB 维度初始分布")
     p.add_argument("--color_prior_std", type=float, default=1.0, help="当 color_prior=gauss 时使用")
+ 
+    p.add_argument("--ctx_t_gate_tau", type=float, default=0.8, help="t-门控的阈值（越大表示更晚启用PV上下文）")
+    p.add_argument("--ctx_t_gate_k", type=float, default=10.0, help="t-门控的陡峭度（sigmoid斜率）")
 
     # ========== Sampling / CFG / EMA ==========
     p.add_argument("--sample_steps", type=int, default=50)
@@ -217,6 +218,8 @@ def main():
             stage_channels=args.ctx_stage_channels, stage_blocks=args.ctx_stage_blocks, stage_res=args.ctx_stage_res,
             with_se=args.ctx_with_se, norm_type=args.ctx_norm, gn_groups=args.ctx_gn_groups,
             with_global=args.ctx_with_global, voxel_normalize=args.ctx_voxel_normalize,
+            # t‑门控
+            use_t_gate=True, t_gate_k=args.ctx_t_gate_k, t_gate_tau=args.ctx_t_gate_tau,
             # Head (逐点 MLP)
             pf_width=args.pf_width, pf_depth=args.pf_depth, pf_emb_dim=args.pf_emb_dim,
             cfg_dropout_p=args.cfg_drop_p,
